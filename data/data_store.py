@@ -179,3 +179,4 @@ def load_ohlcv(
             "close": r.close, "volume": r.volume,
         } for r in rows]
     ).set_index("open_time")
+    return df
