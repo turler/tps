@@ -179,9 +179,3 @@ def load_ohlcv(
             "close": r.close, "volume": r.volume,
         } for r in rows]
     ).set_index("open_time")
-    # Ensure index is always tz-aware UTC
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-    return df

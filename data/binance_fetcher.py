@@ -96,6 +96,7 @@ def update_history(symbol: str, timeframe: str = "1d", lookback_days: int = 365)
     init_db()
     existing = load_ohlcv(symbol, timeframe)
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    since = since.replace(tzinfo=None)
     should_delete=False
     if not existing.empty and existing.index.min() < since:
         last_ts = existing.index.max()

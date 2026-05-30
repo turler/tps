@@ -126,9 +126,9 @@ def run_tps_backtest(
         open_trade = {
             "side": intent.side,
             "entry_price": float(intent.limit_price),
-            "tp": float(intent.take_profit),
-            "sl": float(intent.stop_loss),
-            "qty": float(intent.qty),
+            "tp": intent.take_profit,
+            "sl": intent.stop_loss,
+            "qty": intent.qty,
             "entry_time": bar_close_time,
             "timeframe": intent.meta.get("timeframe"),
             "reason_in": intent.meta.get("reason"),

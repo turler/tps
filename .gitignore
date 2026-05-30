@@ -1,5 +1,6 @@
 .env
 .venv-tps/
+.venv/
 __pycache__/
 *.pyc
 var/*.db

@@ -73,7 +73,10 @@ def seed_history(state: LoopState, lookback_days: int = 120) -> None:
             update_history(state.symbol, tf, lookback_days=lookback_days)
         except Exception as e:  # pragma: no cover - network
             logger.warning(f"seed_history fetch failed for {tf}: {e}")
-        df = load_ohlcv(state.symbol, tf)
+        start_time = None
+        if tf in state.candles and not state.candles[tf].empty:
+            start_time = state.candles[tf].index[0].replace(tzinfo=None)
+        df = load_ohlcv(state.symbol, tf, start=start_time)
         if not df.empty:
             state.candles[tf] = df.tail(_MAX_BARS).copy()
             st = state.strategy.analyze_timeframe(tf, state.candles[tf])
