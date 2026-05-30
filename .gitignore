@@ -1,0 +1,6 @@
+.env
+.venv-tps/
+__pycache__/
+*.pyc
+var/*.db
+var/*.sqlite
