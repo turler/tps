@@ -74,11 +74,11 @@ class BinanceExecutor:
 
 
     def limit_price(self, side, trigger_price):
-        trigger_price = self.get_rounded_price(trigger_price)
+        logger.info(f"Tick size={self._tick_size}")
         if side == 'BUY':
-            return trigger_price - self._tick_size*11
+            return self.get_rounded_price(trigger_price - 10*self._tick_size)
         else:
-            return trigger_price + self._tick_size*11
+            return self.get_rounded_price(trigger_price + 10*self._tick_size)
 
 
     def place(self, intent: OrderIntent) -> PlacedOrder:
