@@ -72,39 +72,74 @@ class BinanceWebSocket:
         logger.debug(f"kline {kline.get('i')} closed={kline.get('x')} c={kline.get('c')}")
 
     async def on_user_event(self, msg: dict):
+        """Normalize a futures user-stream message and dispatch.
+
+        Two event types matter here:
+          * ORDER_TRADE_UPDATE — plain orders (LIMIT/MARKET entries and the
+            reduce-only child fills spawned when a conditional order triggers).
+            The reduce-only child fill carries `si` = the *parent* algoId, which
+            links the close back to the TP/SL we placed.
+          * ALGO_UPDATE — conditional/algo orders (STOP entries, TAKE_PROFIT_MARKET
+            and STOP_MARKET exits). Identified by `aid` (algoId).
+
+        We hand the subclass a single normalized dict so it never has to know
+        which wire shape produced it. See `strategies/tps_websocket.py`.
+        """
         event_type = msg.get('e')
         if event_type not in ('ORDER_TRADE_UPDATE', 'ALGO_UPDATE'):
             return
 
-        order = msg['o']  # futures wraps data inside 'o'
-        status = order['X']
-        if event_type == 'ALGO_UPDATE':
-            order_id = str(order['aid'])
-            client_order_id = str(order['caid']) if order.get('caid') else ""
-        else:
-            order_id = str(order['i'])
-            client_order_id = str(order['c']) if order.get('c') else ""
+        o = msg['o']  # futures wraps the payload inside 'o'
+        status = o.get('X')
 
-        symbol = order['s']
-        side = order['S']
-        qty = order.get('q', '0.0')
-        price = float(order['L']) if order.get('L') else 0.0
-        pnl = float(order['rp']) if order.get('rp') else 0.0
-        close_position = order.get('cp', False)
+        if event_type == 'ALGO_UPDATE':
+            ev = {
+                'event_type': event_type,
+                'status': status,
+                'order_id': str(o['aid']) if o.get('aid') is not None else '',
+                # Algo events are matched by their own algoId (order_id); no
+                # separate parent linkage is needed.
+                'strategy_id': '',
+                'client_order_id': str(o['caid']) if o.get('caid') else '',
+                'order_type': o.get('o', ''),
+                # No fill price on algo events; `tp` is the trigger price, which
+                # for our reduce-only exits equals the TP/SL level.
+                'price': float(o['tp']) if o.get('tp') else 0.0,
+                'pnl': 0.0,
+            }
+        else:  # ORDER_TRADE_UPDATE
+            ev = {
+                'event_type': event_type,
+                'status': status,
+                'order_id': str(o['i']) if o.get('i') is not None else '',
+                # `si` is the originating algoId for a triggered conditional
+                # order's child fill (0/absent for ordinary orders).
+                'strategy_id': str(o['si']) if o.get('si') else '',
+                'client_order_id': str(o['c']) if o.get('c') else '',
+                'order_type': o.get('o', ''),
+                'price': float(o['L']) if o.get('L') else 0.0,  # last filled price
+                'pnl': float(o['rp']) if o.get('rp') else 0.0,  # realized PnL
+            }
+
+        ev.update({
+            'symbol': o.get('s'),
+            'side': o.get('S'),
+            'qty': o.get('q', '0.0'),
+            'reduce_only': bool(o.get('R', False)),
+            'close_position': bool(o.get('cp', False)),
+        })
 
         if status in ('CANCELED', 'EXPIRED'):
-            await self.on_order_cancel(order_id, client_order_id, symbol)
-        elif status == 'FILLED':
-            await self.on_order_filled(order_id, symbol, side, qty, price, pnl,
-                                       close_position, client_order_id)
+            await self.on_order_cancel(ev)
+        elif status in ('FILLED', 'TRIGGERED'):
+            await self.on_order_filled(ev)
 
-    async def on_order_filled(self, order_id, symbol, side, qty, price, pnl,
-                              close_position, client_order_id):
-        """Called when an order is filled — override in subclass."""
+    async def on_order_filled(self, ev: dict):
+        """Called when an order fills/triggers — override in subclass."""
         pass
 
-    async def on_order_cancel(self, order_id, client_order_id, symbol):
-        """Called when an order is cancelled — override in subclass."""
+    async def on_order_cancel(self, ev: dict):
+        """Called when an order is cancelled/expired — override in subclass."""
         pass
 
     # ── Start All Streams ─────────────────────────────────────────

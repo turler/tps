@@ -34,6 +34,9 @@ class PlacedOrder:
     tp_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
     status: str = "NEW"
+    # STOP entries are routed to Binance's conditional/algo endpoint and must be
+    # cancelled by algoId; LIMIT entries are plain orders cancelled by orderId.
+    is_algo: bool = False
 
 
 @dataclass
@@ -74,33 +77,42 @@ class BinanceExecutor:
 
 
     def limit_price(self, side, trigger_price):
-        logger.info(f"Tick size={self._tick_size}")
+        # A stop entry must be marketable the moment it triggers, so its
+        # protective limit is placed *through* the trigger: a BUY-stop fills as
+        # price breaks upward, so the limit sits slightly ABOVE the trigger; a
+        # SELL-stop fills as price breaks down, so the limit sits slightly BELOW.
+        # (The previous direction put the limit on the wrong side, so stop
+        # entries would only fill on a retrace and often never filled at all.)
+        buffer = 10 * self._tick_size
         if side == 'BUY':
-            return self.get_rounded_price(trigger_price - 10*self._tick_size)
+            return self.get_rounded_price(trigger_price + buffer)
         else:
-            return self.get_rounded_price(trigger_price + 10*self._tick_size)
+            return self.get_rounded_price(trigger_price - buffer)
 
 
     def place(self, intent: OrderIntent) -> PlacedOrder:
+        """Place the *entry* order only.
+
+        Binance USD-M Futures has no atomic OTOCO/bracket order (OCO/OTOCO exist
+        only for Spot), so TP and SL cannot be attached to a pending order. We
+        therefore place the bare entry here and attach the reduce-only TP *and*
+        SL once the entry actually fills — see `place_take_profit` /
+        `place_stop_loss`, driven from the user-data stream.
+        """
+        is_algo = (intent.order_type == "STOP")
         if self.paper or self._client is None:
             order_id = f"paper-{len(self._orders)+1}"
-            placed = PlacedOrder(intent=intent, broker_order_id=order_id)
+            placed = PlacedOrder(intent=intent, broker_order_id=order_id, is_algo=is_algo)
             self._orders[intent.tag] = placed
             logger.info(f"[paper] placed {intent.side} {intent.order_type} qty={intent.qty} "
                         f"limit={intent.limit_price} trigger={intent.trigger_price}")
             return placed
 
-        if intent.side == 'BUY':
-            side = 'BUY'
-            reverse_side = 'SELL'
-        else:
-            side = 'SELL'
-            reverse_side = 'BUY'
-
+        side = intent.side  # 'BUY' or 'SELL'
         logger.info(intent)
         if intent.order_type == "STOP":
-            # Both BUY-stop-above and SELL-stop-below are STOP_LOSS_LIMIT on Binance:
-            # the engine triggers when price reaches stopPrice and submits a LIMIT.
+            # STOP (stop-limit) entry — routed to the conditional/algo endpoint,
+            # returns an algoId. No TP/SL attached.
             params = dict(
                 symbol=self.symbol, side=side,
                 quantity=round(intent.qty, self._quantity_precision),
@@ -108,26 +120,13 @@ class BinanceExecutor:
                 price=str(self.limit_price(side, intent.trigger_price)),
                 triggerPrice=str(self.get_rounded_price(intent.trigger_price)),
                 type="STOP",
+                workingType="CONTRACT_PRICE",
             )
-            logger.info("Params STOP order")
-            logger.info(params)
+            logger.info(f"Placing STOP entry: {params}")
             resp = self._client.futures_create_order(**params)
-
-            if intent.take_profit:
-                params = dict(
-                    symbol=self.symbol, side=reverse_side,
-                    reduceOnly=True,
-                    price=str(self.get_rounded_price(intent.take_profit)),
-                    triggerPrice=str(self.get_rounded_price(intent.trigger_price)),
-                    quantity=round(intent.qty, self._quantity_precision),
-                    type='TAKE_PROFIT',
-                    clientAlgoId=str(resp.get("algoId"))+'TP',
-                )
-                logger.info("Params TP of stop order")
-                logger.info(params)
-                res_tp = self._client.futures_create_order(**params)
-            placed = PlacedOrder(intent=intent, broker_order_id=str(resp.get("algoId")), tp_order_id=res_tp['algoId'], sl_order_id=None, status=resp.get("status", "NEW"))
-        else: # LIMIT
+            placed = PlacedOrder(intent=intent, broker_order_id=str(resp.get("algoId")),
+                                 status=resp.get("algoStatus", "NEW"), is_algo=True)
+        else:  # LIMIT
             params = dict(
                 symbol=self.symbol, side=side,
                 quantity=round(intent.qty, self._quantity_precision),
@@ -135,26 +134,74 @@ class BinanceExecutor:
                 price=str(self.get_rounded_price(intent.limit_price)),
                 type="LIMIT",
             )
-
+            logger.info(f"Placing LIMIT entry: {params}")
             resp = self._client.futures_create_order(**params)
-
-            if intent.stop_loss:
-                params = dict(
-                    symbol=self.symbol, side=reverse_side,
-                    reduceOnly=True,
-                    quantity=round(intent.qty, self._quantity_precision),
-                    triggerPrice=str(self.get_rounded_price(intent.stop_loss)),
-                    type='STOP_MARKET',
-                    clientAlgoId=str(resp.get("orderId"))+'SL',
-                )
-                logger.info(params)
-                res_sl = self._client.futures_create_order(**params)
-                placed = PlacedOrder(intent=intent, broker_order_id=str(resp.get("orderId")), tp_order_id=None, sl_order_id=str(res_sl.get('algoId')), status=resp.get("status", "NEW"))
+            placed = PlacedOrder(intent=intent, broker_order_id=str(resp.get("orderId")),
+                                 status=resp.get("status", "NEW"), is_algo=False)
 
         self._orders[intent.tag] = placed
-        logger.info(f"[live] placed order id={placed.broker_order_id}")
-
+        logger.info(f"[live] placed {intent.order_type} entry id={placed.broker_order_id}")
         return placed
+
+    def place_take_profit(self, position_side: str, qty: float, tp_price: float,
+                          working_type: str = "CONTRACT_PRICE") -> Optional[str]:
+        """Place a reduce-only TAKE_PROFIT (limit) that closes the position.
+
+        `position_side` is the side of the *open position* (BUY/SELL); the
+        protective order is submitted on the opposite side. The resting limit
+        sits at exactly `tp_price`; the conditional *triggers* ~10 ticks before
+        that level (`limit_price(close_side, tp_price)`) so the limit is already
+        working in the book by the time price reaches the TP — a maker fill at
+        the TP price rather than a market exit. Returns the algoId.
+        """
+        close_side = SIDE_SELL if position_side == "BUY" else SIDE_BUY
+        if self.paper or self._client is None:
+            tp_id = f"paper-tp-{len(self._orders)+1}"
+            logger.info(f"[paper] TP {close_side} qty={qty} limit={tp_price}")
+            return tp_id
+        params = dict(
+            symbol=self.symbol, side=close_side, type="TAKE_PROFIT",
+            quantity=round(qty, self._quantity_precision), reduceOnly=True,
+            price=str(self.get_rounded_price(tp_price)),
+            triggerPrice=str(self.limit_price(close_side, tp_price)),
+            timeInForce=TIME_IN_FORCE_GTC,
+            workingType=working_type,
+        )
+        logger.info(f"Placing TP (limit): {params}")
+        resp = self._client.futures_create_order(**params)
+        return str(resp.get("algoId"))
+
+    def place_stop_loss(self, position_side: str, qty: float, sl_price: float,
+                        working_type: str = "CONTRACT_PRICE") -> Optional[str]:
+        """Place a reduce-only STOP_MARKET that closes the position at the stop.
+
+        `position_side` is the side of the *open position* (BUY/SELL). Returns
+        the algoId. STOP_MARKET guarantees the position is flattened on trigger.
+        """
+        close_side = SIDE_SELL if position_side == "BUY" else SIDE_BUY
+        if self.paper or self._client is None:
+            sl_id = f"paper-sl-{len(self._orders)+1}"
+            logger.info(f"[paper] SL {close_side} qty={qty} trigger={sl_price}")
+            return sl_id
+        params = dict(
+            symbol=self.symbol, side=close_side, type="STOP_MARKET",
+            quantity=round(qty, self._quantity_precision), reduceOnly=True,
+            triggerPrice=str(self.get_rounded_price(sl_price)),
+            workingType=working_type,
+        )
+        logger.info(f"Placing SL: {params}")
+        resp = self._client.futures_create_order(**params)
+        return str(resp.get("algoId"))
+
+    def cancel_conditional(self, algo_id: Optional[str]) -> None:
+        """Cancel a single conditional/algo order by algoId (best-effort)."""
+        if not algo_id or self.paper or self._client is None:
+            return
+        try:
+            self._client.futures_cancel_order(symbol=self.symbol, algoId=algo_id)
+            logger.info(f"cancelled conditional algoId={algo_id}")
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"cancel conditional {algo_id} failed: {e}")
 
     def cancel(self, tag: str) -> None:
         order = self._orders.pop(tag, None)
@@ -166,16 +213,16 @@ class BinanceExecutor:
 
         if not self.paper and self._client is not None and order.broker_order_id:
             try:
-                if order.intent.order_type == 'STOP':
+                if order.is_algo:
                     self._client.futures_cancel_order(symbol=self.symbol, algoId=order.broker_order_id)
                 else:
                     self._client.futures_cancel_order(symbol=self.symbol, orderId=order.broker_order_id)
-                if order.tp_order_id:
-                    self._client.futures_cancel_order(symbol=self.symbol, algoId=order.tp_order_id)
-                if order.sl_order_id:
-                    self._client.futures_cancel_order(symbol=self.symbol, algoId=order.sl_order_id)
             except Exception as e:  # pragma: no cover
                 logger.warning(f"cancel failed: {e}")
+            # TP/SL protecting an open position are tracked on the Position, not
+            # here, but cancel them too if this order ever carried them.
+            self.cancel_conditional(order.tp_order_id)
+            self.cancel_conditional(order.sl_order_id)
         logger.info(f"cancelled order tag={tag}")
 
     def cancel_all(self) -> None:
@@ -224,11 +271,8 @@ class BinanceExecutor:
                 quantity=round(qty, self._quantity_precision), reduceOnly=True,
             )
             logger.info(f"[live] EOD market close id={resp.get('orderId')}")
-            if order.tp_order_id:
-                self.state.executor._client.futures_cancel_order(symbol=self.symbol, algoId=order.tp_order_id)
-            if order.sl_order_id:
-                self.state.executor._client.futures_cancel_order(symbol=self.symbol, algoId=order.sl_order_id)
-
+            self.cancel_conditional(order.tp_order_id)
+            self.cancel_conditional(order.sl_order_id)
             return str(resp.get("orderId"))
         except Exception as e:  # pragma: no cover
             logger.error(f"EOD market close failed: {e}")

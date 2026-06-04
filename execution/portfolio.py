@@ -20,6 +20,13 @@ class Position:
     risk: float
     broker_order_id: Optional[str] = None
     tag: str = ""
+    # Conditional (algo) order ids of the reduce-only TP/SL that protect this
+    # position. Set once the entry fills and TP/SL are placed. These are the
+    # algoIds returned by Binance — matched against ALGO_UPDATE.aid and against
+    # ORDER_TRADE_UPDATE.si on the reduce-only fill, so no clientAlgoId parsing
+    # is needed to know whether the position closed on TP or SL.
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
 
 
 @dataclass
