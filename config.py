@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     send_copy_trade: bool = False
 
     # Trading defaults
-    tps_symbol: str = "BTCUSDT"
+    tps_symbol: str = "BTCUSDC"
     # Full multi-timeframe set: M1 / M5 / M15 / M30 / H1 / H4 / D1
     tps_timeframes: List[str] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
     tps_entry_timeframe: str = "15m"   # primary timeframe a signal is emitted on
