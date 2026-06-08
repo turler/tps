@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # Trading defaults
     tps_symbol: str = "BTCUSDC"
     # Full multi-timeframe set: M1 / M5 / M15 / M30 / H1 / H4 / D1
-    tps_timeframes: List[str] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    tps_timeframes: List[str] = ["15m", "30m", "1h", "4h", "1d"]
     tps_entry_timeframe: str = "15m"   # primary timeframe a signal is emitted on
     tps_news_filter: bool = False       # stubbed v1; flatten before red USD news
     default_risk_usdt: float = 5.0
